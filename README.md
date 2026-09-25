@@ -1,319 +1,355 @@
-zen-infra — Implementation Guide
-Infra Setup
+# zen-infra
 
-This guide walks you through setting up the zen-pharma infrastructure on your own AWS account from scratch using this repository. Follow each section in order.
+ Terraform infrastructure for the **zen-pharma platform**, running on AWS with Kubernetes, RDS PostgreSQL, ECR, IAM, Secrets Manager, and GitHub Actions.
 
-Table of Contents
-Architecture Overview
-Prerequisites
-Repository Structure
-Step 1 — AWS Account Setup
-Step 2 — S3 State Backend Setup
-Step 3 — Fork and Configure the Repository
-Step 4 — Update Configuration for Your Account
-Step 5 — GitHub Secrets Setup
-Step 6 — GitHub Environment Setup
-Step 7 — Provision Infrastructure via Pipeline
-Step 8 — Verify the Infrastructure
-Infrastructure Details
-Day-2 Operations
-Destroying Infrastructure
-Troubleshooting
-1. Architecture Overview
-This repository provisions a complete Kubernetes-based platform on AWS for the zen-pharma application. All infrastructure is defined as code in Terraform and deployed automatically via GitHub Actions — no manual AWS console clicks required after initial setup.
+ The repository uses reusable Terraform modules and environment-specific configurations for **dev, QA, and production**.
 
-AWS Resources Created by Terraform
-AWS Account (us-east-1)
-│
-├── S3 Bucket  (created manually — state backend for Terraform)
-│   └── zen-pharma-terraform-state-<your-username>
-│       ├── envs/dev/terraform.tfstate
-│       ├── envs/qa/terraform.tfstate
-│       └── envs/prod/terraform.tfstate
-│
-├── VPC  (10.0.0.0/16)
-│   ├── Public Subnets        10.0.1.0/24  (us-east-1a)  ]  NAT Gateway,
-│   │                         10.0.2.0/24  (us-east-1b)  ]  NLB, Ingress
-│   ├── Private EKS Subnets   10.0.3.0/24  (us-east-1a)  ]  EKS worker
-│   │                         10.0.4.0/24  (us-east-1b)  ]  nodes (private)
-│   └── Private RDS Subnets   10.0.5.0/24  (us-east-1a)  ]  RDS PostgreSQL
-│                             10.0.6.0/24  (us-east-1b)  ]  (private)
-│
-├── EKS Cluster  (pharma-dev-cluster, Kubernetes 1.33)
-│   ├── Managed Node Group
-│   │   ├── Instance type : t3.small
-│   │   ├── Desired       : 3 nodes
-│   │   ├── Min / Max     : 1 / 4
-│   │   └── Subnets       : private EKS subnets (no public IP)
-│   └── OIDC Provider
-│       └── Enables IRSA — pods assume IAM roles without static credentials
-│
-├── RDS PostgreSQL  (pharma-dev-postgres)
-│   ├── Engine        : PostgreSQL 15.7
-│   ├── Instance      : db.t3.micro
-│   ├── Storage       : 20 GB gp2, encrypted
-│   ├── Access        : private subnet only, port 5432 from EKS SG only
-│   └── DB name       : pharmadb  /  Master user: pharmaadmin
-│
-├── ECR Repositories  (8 repos, one per service)
-│   ├── api-gateway               (Spring Cloud Gateway, port 8080)
-│   ├── auth-service              (JWT auth, port 8081)
-│   ├── drug-catalog-service      (drug catalogue, port 8082)
-│   ├── inventory-service         (stock management, port 8083)
-│   ├── supplier-service          (vendor management, port 8084)
-│   ├── manufacturing-service     (batch tracking, port 8085)
-│   ├── notification-service      (Node.js, port 3000)
-│   └── pharma-ui                 (React frontend, port 80)
-│   │
-│   └── Each repo has:
-│       ├── scan_on_push = true   (automatic CVE scan on every push)
-│       └── Lifecycle policy      (keep last 10 images, expire older ones)
-│
-├── IAM
-│   ├── EKS Cluster Role          (allows EKS control plane to manage AWS resources)
-│   ├── EKS Node Group Role       (allows worker nodes to pull from ECR, join cluster)
-│   │
-│   ├── GitHub Actions OIDC Role  (pharma-dev-gitlab-runner-role)
-│   │   ├── Trust policy : repo zen-pharma-frontend and zen-pharma-backend only
-│   │   └── Permissions  : ECR push/pull, EKS describe
-│   │   └── How it works : GitHub OIDC token -> AWS STS -> short-lived credentials
-│   │                      No AWS_ACCESS_KEY_ID stored in GitHub
-│   │
-│   ├── ESO IRSA Role             (pharma-dev-eso-role)
-│   │   ├── Trust policy : EKS service account external-secrets/external-secrets
-│   │   └── Permissions  : secretsmanager:GetSecretValue on /pharma/* paths only
-│   │
-│   └── ArgoCD IRSA Role          (pharma-dev-argocd-role)
-│       └── Trust policy : EKS service account argocd/argocd-application-controller
-│
-└── AWS Secrets Manager
-    ├── /pharma/dev/db-credentials   {"username": "pharmaadmin", "password": "..."}
-    └── /pharma/dev/jwt-secret       {"secret": "..."}
-Terraform Module Structure
-zen-infra/
-├── envs/
-│   ├── dev/    <-- calls all modules with dev-specific values
-│   ├── qa/     <-- same modules, different sizing
-│   └── prod/   <-- same modules, production sizing + HA settings
-│
-└── modules/
-    ├── vpc/            creates VPC, subnets, IGW, NAT GW, route tables
-    ├── eks/            creates EKS cluster, node group, OIDC provider
-    ├── rds/            creates RDS instance, subnet group, security group
-    ├── ecr/            creates ECR repos with lifecycle policies
-    ├── iam/            creates OIDC roles for GitHub Actions, ESO, ArgoCD
-    └── secrets-manager/ stores DB password and JWT secret in Secrets Manager
-Each environment directory (envs/dev) calls the modules like functions:
+ > **⚠️ Cost warning**
+>
+>  The dev environment includes EKS and a NAT Gateway, which can incur ongoing AWS charges. Destroy the environment when you're finished using it.
 
-envs/dev/main.tf
-    |
-    |-- module "vpc"              --> modules/vpc/
-    |-- module "eks"              --> modules/eks/   (depends on vpc outputs)
-    |-- module "rds"              --> modules/rds/   (depends on vpc + eks outputs)
-    |-- module "ecr"              --> modules/ecr/
-    |-- module "iam"              --> modules/iam/   (depends on eks OIDC outputs)
-    └-- module "secrets_manager"  --> modules/secrets-manager/
-Modules share data via outputs — for example, module.eks.oidc_provider_arn is passed into module.iam so the IAM trust policy references the exact OIDC provider created for this cluster, not a hardcoded ARN.
+---
 
-Network Traffic Flow
-Internet
-    |
-    v
-AWS Network Load Balancer  (created by NGINX Ingress Controller Helm chart)
-    |  routes by URL path
-    |-- /          -->  pharma-ui       (React, port 80)
-    |-- /api/*     -->  api-gateway     (port 8080)
-                           |
-                           |-- /api/auth/*          --> auth-service        (8081)
-                           |-- /api/catalog/*       --> drug-catalog-svc    (8082)
-                           |-- /api/inventory/*     --> inventory-service   (8083)
-                           |-- /api/suppliers/*     --> supplier-service    (8084)
-                           |-- /api/manufacturing/* --> manufacturing-svc   (8085)
-                           └-- /api/notifications/* --> notification-svc    (3000)
-                                                            |
-                                                    All backend services
-                                                    pull secrets from
-                                                    AWS Secrets Manager
-                                                    via ESO (no passwords
-                                                    in pod spec or config)
-                                                            |
-                                                            v
-                                               RDS PostgreSQL (private subnet)
-GitHub Actions CI/CD Flow for Infrastructure
-Developer creates feature branch in zen-infra
-    |
-    v
-git push origin feature/my-change
-    |
-    v
-Open Pull Request  -->  zen-infra GitHub Actions runs automatically:
-    |
-    |   [Terraform Plan job]
-    |   1. Checkout code
-    |   2. Setup Terraform 1.10.0
-    |   3. Configure AWS credentials  (static IAM keys from GitHub Secrets)
-    |   4. terraform fmt -check       --> fails if code is not formatted
-    |   5. terraform init             --> connects to S3 backend, downloads providers
-    |   6. terraform validate         --> syntax and logic check
-    |   7. terraform plan             --> shows what will change (saved as artifact)
-    |
-    |   Plan output is visible in the Actions tab. PR is blocked if plan fails.
-    |
-    v
-PR reviewed and merged to main
-    |
-    v
-[Terraform Plan job runs again on main - fresh plan]
-    |
-    v
-[Terraform Apply job - PAUSES for manual approval]
-    |
-    |   Go to: Actions --> running workflow --> "Review deployments" --> Approve
-    |
-    v
-[Terraform Apply runs]
-    |   8. terraform apply tfplan     --> provisions/updates AWS resources
-    |      (takes 15-25 min for EKS + RDS)
-    |
-    v
-Infrastructure updated in AWS
-    |
-    v
-EKS cluster is ready for Stage 2 (install NGINX Ingress, ArgoCD, ESO)
-Security Design Decisions
-Decision	Why
-Worker nodes in private subnets	Nodes not reachable from internet; only NLB is public
-RDS in private subnets	Database never exposed to internet; only EKS nodes can connect (port 5432 via SG rule)
-No static AWS keys in GitHub CI	GitHub Actions uses OIDC; credentials are short-lived (1 hour) and scoped to specific repos
-IRSA for pods	Pods never hold AWS credentials; they exchange a projected K8s token for short-lived STS credentials
-Secrets Manager (not ConfigMap)	DB passwords and JWT secret never live in Git or Kubernetes config; ESO syncs them at runtime
-ECR scan on push	Every image is automatically scanned for CVEs when pushed; results visible in ECR console
-S3 state with versioning	Terraform state is versioned — accidental corruption can be rolled back
-2. Prerequisites
-Ensure the following tools are installed on your local machine before starting.
+ ## 🏗️ Architecture
 
-Required Tools
-Tool	Minimum Version	Install
-Terraform	1.10.0+	https://developer.hashicorp.com/terraform/install
-AWS CLI	2.x	https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html
-Git	2.x	https://git-scm.com/downloads
-Verify Installations
+```
+                              Internet
+                                  │
+                                  ▼
+                        ┌──────────────────┐
+                        │ Network Load      │
+                        │ Balancer (NLB)    │
+                        └────────┬─────────┘
+                                 │
+                                 ▼
+                        ┌──────────────────┐
+                        │ NGINX Ingress    │
+                        │ Controller       │
+                        └────────┬─────────┘
+                                 │
+              ┌──────────────────┼──────────────────┐
+              │                  │                  │
+              ▼                  ▼                  ▼
+        ┌───────────┐      ┌────────────┐     ┌──────────────┐
+        │ pharma-ui │      │ API Gateway│     │ Notification │
+        │ React     │      │ :8080      │     │ :3000        │
+        └───────────┘      └─────┬──────┘     └──────────────┘
+                                 │
+                    ┌────────────┼────────────┐
+                    │            │            │
+                    ▼            ▼            ▼
+                 Auth       Catalog       Inventory
+                 :8081       :8082          :8083
+                    │            │            │
+                    └────────────┼────────────┘
+                                 │
+                                 ▼
+                       ┌──────────────────┐
+                       │ RDS PostgreSQL   │
+                       │ Private Subnets  │
+                       └──────────────────┘
+
+                 AWS Secrets Manager
+                         │
+                         ▼
+              External Secrets Operator
+                         │
+                         ▼
+                     Kubernetes
+```
+
+ ### Infrastructure overview
+
+ | Component | Purpose |
+| --- | --- |
+| VPC | Isolated AWS network |
+| Public subnets | NAT Gateway and load balancers |
+| Private EKS subnets | Kubernetes worker nodes |
+| Private RDS subnets | PostgreSQL database |
+| EKS | Managed Kubernetes cluster |
+| RDS PostgreSQL | Application database |
+| ECR | Container image registry |
+| IAM | AWS permissions and workload identity |
+| Secrets Manager | Application secrets |
+| S3 | Terraform remote state |
+| GitHub Actions | Infrastructure CI/CD |
+
+---
+
+ # 📋 Table of Contents
+
+ - Architecture
+- Prerequisites
+- Repository Structure
+- AWS Resources
+- Getting Started
+  - 1\. Configure AWS
+  - 2\. Create the Terraform State Bucket
+  - 3\. Fork and Clone
+  - 4\. Configure Your Account
+  - 5\. Configure GitHub Secrets
+  - 6\. Configure GitHub Environment
+  - 7\. Deploy
+  - 8\. Verify
+- Environment Structure
+- Networking
+- Security
+- CI/CD
+- Day-2 Operations
+- Destroying Infrastructure
+- Troubleshooting
+- Cost Estimate
+
+---
+
+ # 🔧 Prerequisites
+
+ Install the following tools:
+
+ | Tool | Version |
+| --- | --- |
+| Terraform | 1.10+ |
+| AWS CLI | 2.x |
+| Git | 2.x |
+| kubectl | Latest recommended |
+
+Verify your installation:
+
+```
 terraform version
-# Terraform v1.10.x
-
 aws --version
-# aws-cli/2.x.x
-
 git --version
-# git version 2.x.x
-Required Access
-An AWS account with administrator access (or sufficient permissions — see Step 1)
-A GitHub account
-The zen-infra repository forked to your GitHub account
-3. Repository Structure
+kubectl version --client
+```
+
+ You will also need:
+
+ - An AWS account
+- AWS permissions sufficient to create the infrastructure
+- A GitHub account
+- A fork of this repository
+
+---
+
+ # 📁 Repository Structure
+
+```
 zen-infra/
+│
 ├── .github/
-│   ├── dependabot.yml                    # Automated dependency update config
 │   └── workflows/
-│       └── terraform.yml                 # CI/CD pipeline — plan + apply + destroy
+│       └── terraform.yml
 │
 ├── envs/
 │   ├── dev/
-│   │   ├── backend.tf                    # S3 remote state config for dev
-│   │   ├── providers.tf                  # AWS, Kubernetes, TLS provider config
-│   │   ├── main.tf                       # Module calls with dev-specific values
-│   │   ├── variables.tf                  # Input variable declarations
-│   │   └── outputs.tf                    # Output values (cluster name, RDS endpoint)
-│   ├── qa/                               # QA environment (structure mirrors dev)
-│   └── prod/                             # Prod environment (structure mirrors dev)
+│   │   ├── backend.tf
+│   │   ├── providers.tf
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   │
+│   ├── qa/
+│   │   └── ...
+│   │
+│   └── prod/
+│       └── ...
 │
-└── modules/
-    ├── vpc/                              # VPC, subnets, IGW, NAT Gateway, route tables
-    ├── eks/                              # EKS cluster, node group, OIDC provider
-    ├── rds/                              # RDS PostgreSQL, subnet group, security group
-    ├── ecr/                              # ECR repositories and lifecycle policies
-    ├── iam/                              # GitHub Actions OIDC role and policy
-    └── secrets-manager/                  # Secrets Manager secrets for app credentials
-Key design decisions:
+├── modules/
+│   ├── vpc/
+│   ├── eks/
+│   ├── rds/
+│   ├── ecr/
+│   ├── iam/
+│   └── secrets-manager/
+│
+└── README.md
+```
 
-Directory-per-environment (envs/dev, envs/qa, envs/prod) — complete isolation, separate state files, different resource sizing per environment
-Shared modules — all environments call the same modules with different input values
-No terraform.tfvars — secrets are never stored on disk, passed at runtime from GitHub Secrets
-4. Step 1 — AWS Account Setup
-4.1 Create an IAM User for Terraform (if not using OIDC)
-For the initial bootstrap (before OIDC is set up via Terraform), you need an IAM user with programmatic access.
+ ### Module responsibilities
 
-Go to AWS Console → IAM → Users → Create user:
+ | Module | Responsibility |
+| --- | --- |
+| `vpc` | VPC, subnets, routes, NAT Gateway, Internet Gateway |
+| `eks` | EKS cluster, node group, OIDC provider |
+| `rds` | PostgreSQL, subnet group, security groups |
+| `ecr` | Container repositories and lifecycle policies |
+| `iam` | IAM roles and workload identity |
+| `secrets-manager` | Application secrets |
 
-Username: terraform-ci
-Access type: Programmatic access
-Permissions: Attach the following managed policies:
-AdministratorAccess (simplest for learning — scope down in production)
-Save the Access Key ID and Secret Access Key — you will need these in Step 5.
+Each environment calls the same modules with environment-specific configuration.
 
-Note for production: Scope IAM permissions to only what Terraform needs — EC2, EKS, RDS, ECR, IAM, Secrets Manager, S3, VPC.
+---
 
-4.2 Configure AWS CLI Locally
+ # ☁️ AWS Resources
+
+ The dev environment creates approximately:
+
+ ### Networking
+
+ - VPC: `10.0.0.0/16`
+- 2 public subnets
+- 2 private EKS subnets
+- 2 private RDS subnets
+- Internet Gateway
+- NAT Gateway
+- Route tables
+
+ ### EKS
+
+ - Kubernetes `1.33`
+- EKS cluster
+- Managed node group
+- `t3.small` worker nodes
+- Desired nodes: 3
+- Minimum nodes: 2
+- Maximum nodes: 4
+- OIDC provider for IRSA
+
+ ### RDS
+
+ - PostgreSQL `15.7`
+- Instance: `db.t3.micro`
+- Storage: 20 GB
+- Encrypted storage
+- Private access only
+- Port `5432`
+- Accessible from the EKS security group
+
+ ### ECR
+
+ Container repositories for:
+
+```
+api-gateway
+auth-service
+drug-catalog-service
+inventory-service
+supplier-service
+manufacturing-service
+notification-service
+pharma-ui
+```
+
+ Repositories use:
+
+ - Image scanning on push
+- Mutable image tags
+- Lifecycle policies
+- Automatic cleanup of older images
+
+---
+
+ # 🚀 Getting Started
+
+ ## 1\. Configure AWS
+
+ Configure the AWS CLI:
+
+```
 aws configure
-# AWS Access Key ID: <your-access-key-id>
-# AWS Secret Access Key: <your-secret-access-key>
-# Default region name: us-east-1
-# Default output format: json
-Verify it works:
+```
 
+ Use:
+
+```
+AWS Access Key ID:     <your-access-key>
+AWS Secret Access Key: <your-secret-key>
+Default region:        us-east-1
+Default output:        json
+```
+
+ Verify your credentials:
+
+```
 aws sts get-caller-identity
-# Should return your account ID, user ARN, and user ID
-5. Step 2 — S3 State Backend Setup
-Terraform requires an S3 bucket to store its state file. This bucket must exist before running Terraform. Create it manually — you only do this once.
+```
 
-5.1 Create the S3 Bucket
-Replace YOUR-GITHUB-USERNAME with your actual GitHub username to make the bucket name unique.
+ You should receive your AWS account and IAM identity information.
 
-# Create the bucket
+ > **Security:** Never commit AWS credentials to Git.
+
+---
+
+ ## 2\. Create the Terraform State Bucket
+
+ Terraform state is stored remotely in S3.
+
+ Choose a globally unique bucket name:
+
+```
+export TF_STATE_BUCKET="zen-pharma-terraform-state-YOUR-GITHUB-USERNAME"
+```
+
+ Create the bucket:
+
+```
 aws s3api create-bucket \
-  --bucket zen-pharma-terraform-state-YOUR-GITHUB-USERNAME \
+  --bucket "$TF_STATE_BUCKET" \
   --region us-east-1
+```
 
-# Enable versioning (allows state rollback)
+ Enable versioning:
+
+```
 aws s3api put-bucket-versioning \
-  --bucket zen-pharma-terraform-state-YOUR-GITHUB-USERNAME \
+  --bucket "$TF_STATE_BUCKET" \
   --versioning-configuration Status=Enabled
+```
 
-# Enable encryption
+ Enable encryption:
+
+```
 aws s3api put-bucket-encryption \
-  --bucket zen-pharma-terraform-state-YOUR-GITHUB-USERNAME \
-  --server-side-encryption-configuration '{
-    "Rules": [{
-      "ApplyServerSideEncryptionByDefault": {
-        "SSEAlgorithm": "AES256"
-      }
-    }]
-  }'
+  --bucket "$TF_STATE_BUCKET" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
 
-# Block all public access
+ Block public access:
+
+```
 aws s3api put-public-access-block \
-  --bucket zen-pharma-terraform-state-YOUR-GITHUB-USERNAME \
+  --bucket "$TF_STATE_BUCKET" \
   --public-access-block-configuration \
-    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-5.2 Verify the Bucket
-aws s3 ls s3://zen-pharma-terraform-state-YOUR-GITHUB-USERNAME
-# Should return empty (no error)
-6. Step 3 — Fork and Configure the Repository
-6.1 Fork the Repository
-Go to github.com/your-github-username/zen-infra
-Click Fork (top right)
-Select your account as the destination
-Clone your fork locally:
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+ Verify:
+
+```
+aws s3 ls "s3://$TF_STATE_BUCKET"
+```
+
+ The bucket should exist and initially be empty.
+
+---
+
+ ## 3\. Fork and Clone
+
+ Fork the repository to your GitHub account.
+
+ Then:
+
+```
 git clone https://github.com/YOUR-GITHUB-USERNAME/zen-infra.git
 cd zen-infra
-7. Step 4 — Update Configuration for Your Account
-You need to update four files to point to your S3 bucket and GitHub username.
+```
 
-7.1 Update Backend Configuration
-Update the bucket name in all three environment backend files:
+---
 
+ ## 4\. Configure Your Account
+
+ Update the S3 bucket in:
+
+```
 envs/dev/backend.tf
+envs/qa/backend.tf
+envs/prod/backend.tf
+```
 
+ Example:
+
+```
 terraform {
   backend "s3" {
     bucket       = "zen-pharma-terraform-state-YOUR-GITHUB-USERNAME"
@@ -323,383 +359,869 @@ terraform {
     use_lockfile = true
   }
 }
-envs/qa/backend.tf — same change, key stays envs/qa/terraform.tfstate
+```
 
-envs/prod/backend.tf — same change, key stays envs/prod/terraform.tfstate
+ Each environment should use its own state key:
 
-7.2 Update GitHub Organisation Variable
-In envs/dev/variables.tf, update the default value for github_org:
+```
+envs/dev/terraform.tfstate
+envs/qa/terraform.tfstate
+envs/prod/terraform.tfstate
+```
 
+ ### Configure GitHub organization/user
+
+ Update `github_org` in:
+
+```
+envs/dev/variables.tf
+envs/qa/variables.tf
+envs/prod/variables.tf
+```
+
+ Example:
+
+```
 variable "github_org" {
   description = "GitHub username or organization"
   type        = string
-  default     = "YOUR-GITHUB-USERNAME"   # ← change this
+  default     = "YOUR-GITHUB-USERNAME"
 }
-Do the same in envs/qa/variables.tf and envs/prod/variables.tf.
+```
 
-7.3 Update the GitHub Actions Workflow
-In .github/workflows/terraform.yml, update the github_org value:
+---
 
-- name: Terraform Plan
-  run: |
-    terraform plan \
-      -var="db_password=${{ secrets.DEV_DB_PASSWORD }}" \
-      -var="jwt_secret=${{ secrets.DEV_JWT_SECRET }}" \
-      -var="github_org=YOUR-GITHUB-USERNAME" \    # ← change this
-      -out=tfplan \
-      -no-color
-7.4 Commit and Push Changes
-git add envs/dev/backend.tf envs/qa/backend.tf envs/prod/backend.tf
-git add envs/dev/variables.tf envs/qa/variables.tf envs/prod/variables.tf
-git add .github/workflows/terraform.yml
-git commit -m "config: update bucket name and github org for my account"
-git push origin main
-8. Step 5 — GitHub Secrets Setup
-The pipeline needs AWS credentials and application secrets to run Terraform. These are stored as encrypted GitHub Secrets — never in code.
+ # 🔐 5. Configure GitHub Secrets
 
-8.1 Add Repository Secrets
-Go to your fork on GitHub: Settings → Secrets and variables → Actions → New repository secret
+ Go to:
 
-Add the following secrets:
+ **GitHub → Repository → Settings → Secrets and variables → Actions**
 
-Secret Name	Value	Description
-AWS_ACCESS_KEY_ID	Your IAM user access key ID	AWS authentication for Terraform
-AWS_SECRET_ACCESS_KEY	Your IAM user secret access key	AWS authentication for Terraform
-DEV_DB_PASSWORD	A strong password (min 8 chars)	RDS PostgreSQL master password
-DEV_JWT_SECRET	A long random string	JWT signing secret for the app
-Generating a strong random secret:
+ Create these repository secrets:
 
-# Generate a random JWT secret
+ | Secret | Purpose |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID` | AWS authentication |
+| `AWS_SECRET_ACCESS_KEY` | AWS authentication |
+| `DEV_DB_PASSWORD` | RDS master password |
+| `DEV_JWT_SECRET` | JWT signing secret |
+
+Generate a strong JWT secret:
+
+```
 openssl rand -hex 32
-Important: Once set, these values are never visible again in the GitHub UI. Store them in a password manager.
+```
 
-9. Step 6 — GitHub Environment Setup
-GitHub Environments add an approval gate before terraform apply runs. This ensures a human reviews the plan before infrastructure changes are applied.
+ > **Important:** Secrets should never be committed to Git or stored in Terraform files.
 
-9.1 Create the Dev Environment
-Go to your fork on GitHub: Settings → Environments → New environment
+---
 
-Name: dev
-Click Configure environment
-9.2 Add Required Reviewer
-Under Deployment protection rules:
+ # 🛡️ 6. Configure GitHub Environment
 
-Check Required reviewers
-Search for and add your GitHub username
-Leave Prevent self-review unchecked (you are a solo learner)
-Click Save protection rules
-9.3 What This Does
-When the pipeline runs after a merge to main:
+ Create a GitHub environment named:
 
-The plan job runs automatically
-The apply job starts but pauses — GitHub shows a "Review deployments" button
-You review the plan in the Actions logs
-You click Approve and deploy
-terraform apply runs
-This prevents accidental infrastructure changes — even if bad code merges to main, a human must approve before anything changes in AWS.
+```
+dev
+```
 
-10. Step 7 — Provision Infrastructure via Pipeline
-With everything configured, you are ready to provision the infrastructure.
+ Navigate to:
 
-10.1 Create a Feature Branch
-Never push directly to main for infrastructure changes. Use a PR:
+ **Settings → Environments → New environment**
 
+ Add a required reviewer under:
+
+ **Deployment protection rules → Required reviewers**
+
+ This creates a manual approval gate before Terraform can apply infrastructure changes.
+
+---
+
+ # 🚢 7. Deploy
+
+ The recommended workflow is:
+
+```
+Feature branch
+      │
+      ▼
+Pull Request
+      │
+      ▼
+Terraform Plan
+      │
+      ▼
+Review
+      │
+      ▼
+Merge to main
+      │
+      ▼
+Fresh Terraform Plan
+      │
+      ▼
+Manual Approval
+      │
+      ▼
+Terraform Apply
+```
+
+ Create a feature branch:
+
+```
 git checkout -b feature/initial-setup
-Make a small change to trigger the pipeline — for example, add a comment to envs/dev/main.tf:
+```
 
-# Initial dev environment setup
-data "aws_caller_identity" "current" {}
-git add envs/dev/main.tf
-git commit -m "feat: initial dev environment setup"
+ Make a small configuration change, then:
+
+```
+git add .
+git commit -m "feat: initial infrastructure setup"
 git push origin feature/initial-setup
-10.2 Open a Pull Request
-Go to your fork on GitHub and open a PR from feature/initial-setup → main.
+```
 
-The Terraform Plan job will run automatically. After a few minutes, check the Actions tab to see the plan output. Verify:
+ Open a Pull Request against `main`.
 
-Plan: X to add, 0 to change, 0 to destroy
-No unexpected changes or errors
-10.3 Merge the PR
-Once the plan looks correct, merge the PR. This triggers the pipeline on main:
+ The GitHub Actions pipeline will run:
 
-Plan job runs again (fresh plan on merge)
-Apply job starts and pauses for approval
-Go to Actions → the running workflow → Review deployments
-Click Approve and deploy
-10.4 Wait for Apply to Complete
-The apply will take 15–25 minutes because:
+```
+terraform fmt
+terraform init
+terraform validate
+terraform plan
+```
 
-EKS cluster creation: ~10 minutes
-EKS node group provisioning: ~5 minutes
-RDS instance creation: ~5 minutes
-Do not cancel the job — a cancelled mid-apply leaves partial state.
+ Review the plan before merging.
 
-Monitor progress in Actions → the running workflow → Terraform Apply step.
+ After merging, the pipeline generates another plan and waits for deployment approval.
 
-11. Step 8 — Verify the Infrastructure
-After apply completes, verify everything was created correctly.
+ Go to:
 
-11.1 Check Terraform Outputs
-The apply job logs will show outputs at the end:
+ **GitHub → Actions → Terraform Infrastructure → Review deployments**
 
-Apply complete! Resources: 45 added, 0 changed, 0 destroyed.
+ Approve the deployment.
 
-Outputs:
+ ### Expected deployment time
 
-eks_cluster_name = "pharma-dev-cluster"
-rds_endpoint     = "pharma-dev-postgres.xxxxxxxx.us-east-1.rds.amazonaws.com"
-11.2 Verify in AWS Console
-EKS:
+ A full dev deployment typically takes approximately:
 
-Go to AWS Console → EKS → Clusters
-Verify pharma-dev-cluster is Active
-Click the cluster → Compute tab → verify node group shows 3 nodes Ready
-RDS:
+ - EKS cluster: \~10 minutes
+- EKS node group: \~5 minutes
+- RDS: \~5 minutes
 
-Go to AWS Console → RDS → Databases
-Verify pharma-dev-postgres is Available
-ECR:
+ Allow approximately **15–25 minutes** for the complete deployment.
 
-Go to AWS Console → ECR → Repositories
-Verify 5 repositories exist: api-gateway, auth-service, pharma-ui, notification-service, drug-catalog-service
-Secrets Manager:
+---
 
-Go to AWS Console → Secrets Manager
-Verify /pharma/dev/db-credentials and /pharma/dev/jwt-secret exist
-11.3 Connect to the EKS Cluster Locally
-# Update local kubeconfig
+ # ✅ 8. Verify the Infrastructure
+
+ After Terraform finishes, check the outputs:
+
+```
+cd envs/dev
+terraform output
+```
+
+ You should see values such as:
+
+```
+eks_cluster_name
+rds_endpoint
+```
+
+ ### Check EKS
+
+```
+aws eks describe-cluster \
+  --name pharma-dev-cluster \
+  --query 'cluster.status'
+```
+
+ Expected:
+
+```
+"ACTIVE"
+```
+
+ Configure kubectl:
+
+```
 aws eks update-kubeconfig \
   --region us-east-1 \
   --name pharma-dev-cluster
+```
 
-# Verify connection
+ Check nodes:
+
+```
 kubectl get nodes
-# Should show 3 nodes in Ready state
+```
 
+ Expected:
+
+```
+NAME                    STATUS   ROLES    AGE
+...                     Ready    <none>   ...
+...                     Ready    <none>   ...
+...                     Ready    <none>   ...
+```
+
+ Check namespaces:
+
+```
 kubectl get namespaces
-# Should show default, kube-system, kube-public, kube-node-lease
-12. Infrastructure Details
-12.1 Networking
-Resource	Value	Purpose
-VPC CIDR	10.0.0.0/16	Main network
-Public Subnet 1	10.0.1.0/24 (us-east-1a)	NAT Gateway, Load Balancers
-Public Subnet 2	10.0.2.0/24 (us-east-1b)	NAT Gateway, Load Balancers
-Private EKS Subnet 1	10.0.3.0/24 (us-east-1a)	EKS worker nodes
-Private EKS Subnet 2	10.0.4.0/24 (us-east-1b)	EKS worker nodes
-Private RDS Subnet 1	10.0.5.0/24 (us-east-1a)	RDS PostgreSQL
-Private RDS Subnet 2	10.0.6.0/24 (us-east-1b)	RDS PostgreSQL
-Worker nodes and RDS are in private subnets — no direct internet access. Outbound traffic routes through the NAT Gateway.
+```
 
-12.2 EKS Cluster
-Setting	Dev Value	Notes
-Cluster version	1.33	Update periodically
-Node instance type	t3.small	Cost-optimised for dev
-Desired nodes	3	Adjust based on workload
-Min nodes	2	Minimum for HA
-Max nodes	4	Auto-scaling ceiling
-OIDC provider	Enabled	Required for IRSA
-12.3 RDS PostgreSQL
-Setting	Dev Value	Prod Value
-Engine version	15.7	15.7
-Instance class	db.t3.micro	Larger (db.t3.medium+)
-Storage	20 GB gp2	More, with autoscaling
-Multi-AZ	No	Yes
-Backup retention	0 days	7 days
-Deletion protection	No	Yes
-Encryption	Yes	Yes
-Public access	No	No
-RDS is only accessible from EKS worker nodes via the security group — port 5432 from the EKS cluster security group only.
+---
 
-12.4 ECR Repositories
-All 5 repositories have:
+ # 🌐 Networking
 
-image_tag_mutability = MUTABLE — allows overwriting tags (useful in dev)
-scan_on_push = true — automatic vulnerability scanning on every push
-Lifecycle policy: keep last 10 images, expire older ones automatically
-12.5 GitHub Actions OIDC
-The IAM module creates a GitHub Actions OIDC role that allows CI/CD pipelines in zen-pharma-frontend and zen-pharma-backend to push images to ECR without storing AWS credentials in GitHub Secrets.
+ The dev environment uses:
 
-How it works:
+ | Subnet | CIDR | AZ | Purpose |
+| --- | --- | --- | --- |
+| Public 1 | `10.0.1.0/24` | `us-east-1a` | NAT / Load Balancer |
+| Public 2 | `10.0.2.0/24` | `us-east-1b` | NAT / Load Balancer |
+| Private EKS 1 | `10.0.3.0/24` | `us-east-1a` | EKS nodes |
+| Private EKS 2 | `10.0.4.0/24` | `us-east-1b` | EKS nodes |
+| Private RDS 1 | `10.0.5.0/24` | `us-east-1a` | PostgreSQL |
+| Private RDS 2 | `10.0.6.0/24` | `us-east-1b` | PostgreSQL |
 
-GitHub mints a short-lived OIDC token per workflow run
-The workflow calls aws-actions/configure-aws-credentials with the role ARN
-AWS validates the token and issues temporary STS credentials (1 hour)
-CI uses these credentials to push images to ECR
-The role is restricted to:
+Worker nodes and RDS remain in private subnets.
 
-Only YOUR-GITHUB-USERNAME/zen-pharma-frontend and YOUR-GITHUB-USERNAME/zen-pharma-backend repos
-Only main and develop branches
-13. Day-2 Operations
-Making Infrastructure Changes
-Always use the PR-based flow:
+ Outbound traffic from private resources uses the NAT Gateway.
 
-# 1. Create a branch
-git checkout -b feature/your-change
+---
 
-# 2. Make your Terraform changes
-# Edit files in envs/dev/ or modules/
+ # 🔒 Security Design
 
-# 3. Test locally first
-cd envs/dev
+ The infrastructure is designed around several security principles.
+
+ ### Private worker nodes
+
+ EKS worker nodes are deployed in private subnets and don't receive public IP addresses.
+
+ ### Private database
+
+ RDS is deployed in private subnets and isn't publicly accessible.
+
+ Port `5432` is restricted to the appropriate EKS security group.
+
+ ### Secrets Manager
+
+ Application secrets are stored in AWS Secrets Manager:
+
+```
+/pharma/dev/db-credentials
+/pharma/dev/jwt-secret
+```
+
+ Secrets are not stored in Git or Kubernetes manifests.
+
+ ### External Secrets Operator
+
+ ESO retrieves secrets from Secrets Manager and makes them available to workloads inside Kubernetes.
+
+ ### IRSA
+
+ Kubernetes workloads can use IAM Roles for Service Accounts instead of static AWS credentials.
+
+ ### GitHub Actions
+
+ The repository uses GitHub Actions to automate infrastructure deployment.
+
+ > **Production improvement:** Replace long-lived AWS access keys in GitHub Secrets with GitHub Actions OIDC wherever possible.
+
+---
+
+ # 🔄 CI/CD
+
+ The infrastructure pipeline is defined in:
+
+```
+.github/workflows/terraform.yml
+```
+
+ ### Pull Request
+
+ Every infrastructure PR should run:
+
+```
+terraform fmt -check
 terraform init
-terraform plan \
-  -var="db_password=test" \
-  -var="jwt_secret=test"
+terraform validate
+terraform plan
+```
 
-# 4. Push and open a PR
-git add .
-git commit -m "describe your change"
-git push origin feature/your-change
-# Open PR on GitHub → plan runs automatically
+ The plan should be reviewed before merging.
 
-# 5. Review the plan in Actions logs
-# 6. Merge if plan is correct → approve apply
-Scaling the EKS Node Group
-Edit envs/dev/main.tf:
+ ### Main branch
 
-module "eks" {
-  ...
-  desired_capacity = 5    # ← change this
-  min_size         = 3
-  max_size         = 8
-}
-Open a PR, review the plan (should show EKS node group update), merge, approve apply.
+ After merging:
 
-Adding a New ECR Repository
-Edit envs/dev/main.tf:
+```
+Terraform Plan
+      ↓
+Manual Approval
+      ↓
+Terraform Apply
+```
 
-module "ecr" {
-  ...
-  repositories = [
-    "api-gateway",
-    "auth-service",
-    "pharma-ui",
-    "notification-service",
-    "drug-catalog-service",
-    "new-service"            # ← add here
-  ]
-}
-Plan will show 2 new resources: aws_ecr_repository.main["new-service"] and its lifecycle policy.
+ This provides a controlled deployment process while keeping infrastructure changes version-controlled.
 
-Checking State
+---
+
+ # 🛠️ Day-2 Operations
+
+ ## Make an infrastructure change
+
+ Create a branch:
+
+```
+git checkout -b feature/update-infrastructure
+```
+
+ Make your Terraform changes.
+
+ Test locally:
+
+```
 cd envs/dev
 
-# List all resources in state
-terraform state list
+terraform init
 
-# Inspect a specific resource
-terraform state show module.eks.aws_eks_cluster.main
-
-# Check for drift (what changed in AWS outside Terraform)
 terraform plan \
   -var="db_password=dummy" \
   -var="jwt_secret=dummy"
-14. Destroying Infrastructure
-Warning: This permanently deletes all infrastructure including the EKS cluster, RDS database, and all data. There is no undo.
+```
 
-Via Pipeline (Recommended)
-Go to your fork on GitHub → Actions
-Select Terraform Infrastructure workflow
-Click Run workflow
-Set:
-Terraform action: destroy
-Type "destroy" to confirm: destroy
-Click Run workflow
-The destroy job will pause for approval — review then approve
-Wait 15–25 minutes for all resources to be deleted
-Locally (Alternative)
+ Commit and push:
+
+```
+git add .
+git commit -m "feat: update infrastructure"
+git push origin feature/update-infrastructure
+```
+
+ Open a Pull Request and review the generated Terraform plan.
+
+---
+
+ ## Check Terraform state
+
+```
 cd envs/dev
+terraform state list
+```
+
+ Inspect a resource:
+
+```
+terraform state show module.eks.aws_eks_cluster.main
+```
+
+---
+
+ ## Check for drift
+
+ To compare Terraform state with the actual infrastructure:
+
+```
+terraform plan
+```
+
+ For a refresh-only check:
+
+```
+terraform plan -refresh-only
+```
+
+ This is particularly useful after manually changing or deleting AWS resources.
+
+---
+
+ ## Scale the EKS node group
+
+ Update the module configuration:
+
+```
+module "eks" {
+  # ...
+
+  desired_capacity = 5
+  min_size         = 3
+  max_size         = 8
+}
+```
+
+ Then use the normal PR workflow.
+
+---
+
+ # 💥 Destroying Infrastructure
+
+ > **⚠️ WARNING**
+>
+>  Destroying the environment permanently removes infrastructure. This includes EKS, RDS, networking resources, and other AWS resources. Database data may be permanently lost.
+
+ ## Recommended: GitHub Actions
+
+ Use the infrastructure workflow:
+
+ **GitHub → Actions → Terraform Infrastructure → Run workflow**
+
+ Select:
+
+```
+Terraform action: destroy
+```
+
+ Enter the required confirmation:
+
+```
+destroy
+```
+
+ The destroy job will require approval before execution.
+
+ Allow approximately **15–25 minutes** for a complete teardown.
+
+---
+
+ ## Local destroy
+
+ From the dev environment:
+
+```
+cd envs/dev
+
 terraform init
+```
+
+ Then:
+
+```
 terraform destroy \
   -var="db_password=dummy" \
   -var="jwt_secret=dummy" \
   -var="github_org=YOUR-GITHUB-USERNAME"
-Type yes when prompted.
+```
 
-After Destroying
-The S3 state bucket is not deleted by Terraform destroy — it is managed separately. To delete it:
+ Terraform will show the resources it intends to delete.
 
-# Empty the bucket first
-aws s3 rm s3://zen-pharma-terraform-state-YOUR-GITHUB-USERNAME --recursive
+ Type:
 
-# Delete the bucket
+```
+yes
+```
+
+ to confirm.
+
+ ### Important
+
+ Don't manually delete AWS resources while Terraform is actively destroying them.
+
+ If resources have already been manually deleted, refresh Terraform's state first:
+
+```
+terraform plan -refresh-only
+```
+
+ Then:
+
+```
+terraform apply -refresh-only
+```
+
+ Finally:
+
+```
+terraform plan
+```
+
+---
+
+ # 🧹 Removing the Terraform State Bucket
+
+ `terraform destroy` does **not** delete the S3 backend bucket because Terraform needs the backend to manage its own state.
+
+ After all environments have been destroyed, you can remove the bucket manually.
+
+ Empty it:
+
+```
+aws s3 rm \
+  s3://zen-pharma-terraform-state-YOUR-GITHUB-USERNAME \
+  --recursive
+```
+
+ Then delete it:
+
+```
 aws s3api delete-bucket \
   --bucket zen-pharma-terraform-state-YOUR-GITHUB-USERNAME \
   --region us-east-1
-15. Troubleshooting
-Plan shows resources already exist (RepositoryAlreadyExistsException)
-ECR repositories cannot be destroyed if they contain images. If you recreated the stack after a destroy, images may still exist in the repos.
+```
 
-Fix — delete repos manually then re-run:
+ > Make sure you no longer need any Terraform state versions before deleting the bucket.
 
-for repo in api-gateway auth-service pharma-ui notification-service drug-catalog-service; do
-  aws ecr delete-repository \
-    --repository-name $repo \
-    --force \
-    --region us-east-1
-done
-Then re-trigger the pipeline.
+---
 
-Apply failed halfway through
-Do not panic. Terraform updates state for every resource it successfully creates.
+ # 🐛 Troubleshooting
 
-Read the error in the Actions logs (expand the Apply step, scroll up from the bottom)
-Fix the root cause
-Re-trigger the pipeline — it will continue from where it left off
-State lock error
-Error: Error acquiring the state lock
-Another apply is running (or a previous one crashed mid-run). Wait for it to finish. If you are certain no apply is running:
+ ## `RepositoryAlreadyExistsException`
 
-cd envs/dev
-terraform force-unlock <LOCK-ID>
-# Lock ID is shown in the error message
-terraform init fails — bucket does not exist
-You have not created the S3 bucket yet. Follow Step 2.
+ ECR repositories may still contain images.
 
-EKS nodes not joining the cluster
+ Delete the repository:
+
+```
+aws ecr delete-repository \
+  --repository-name api-gateway \
+  --force \
+  --region us-east-1
+```
+
+ Repeat for the affected repositories.
+
+---
+
+ ## Terraform says a resource already exists
+
+ Refresh state:
+
+```
+terraform plan -refresh-only
+```
+
+ Then:
+
+```
+terraform apply -refresh-only
+```
+
+ If the resource genuinely exists in AWS but isn't in Terraform state, investigate before importing or deleting it.
+
+---
+
+ ## Terraform destroy says a subnet has dependencies
+
+ This usually means something is still using the subnet.
+
+ Check network interfaces:
+
+```
+aws ec2 describe-network-interfaces \
+  --filters "Name=subnet-id,Values=<subnet-id>" \
+  --query 'NetworkInterfaces[*].[NetworkInterfaceId,Status,Description,InterfaceType]' \
+  --output table
+```
+
+ Common causes include:
+
+ - NAT Gateway
+- Load Balancer
+- VPC Endpoint
+- Lambda VPC ENI
+- EKS resources
+- Other AWS-managed network interfaces
+
+ Delete the owning resource rather than manually deleting the ENI.
+
+---
+
+ ## Internet Gateway cannot be detached
+
+ You may see:
+
+```
+DependencyViolation:
+Network VPC has some mapped public address(es).
+```
+
+ Check public addresses:
+
+```
+aws ec2 describe-addresses \
+  --filters "Name=domain,Values=vpc" \
+  --query 'Addresses[*].[AllocationId,PublicIp,AssociationId,InstanceId,NetworkInterfaceId]' \
+  --output table
+```
+
+ Also check NAT Gateways:
+
+```
+aws ec2 describe-nat-gateways \
+  --filter "Name=vpc-id,Values=<vpc-id>" \
+  --query 'NatGateways[*].[NatGatewayId,State,SubnetId]' \
+  --output table
+```
+
+ Remove the resource owning the public address and then retry:
+
+```
+terraform destroy
+```
+
+---
+
+ ## Terraform state lock error
+
+ If you see:
+
+```
+Error acquiring the state lock
+```
+
+ First make sure another Terraform operation isn't running.
+
+ If you're certain there isn't an active operation:
+
+```
+terraform force-unlock <LOCK_ID>
+```
+
+ > Never force-unlock a state that another Terraform operation is actively using.
+
+---
+
+ ## EKS nodes aren't joining
+
+ Check:
+
+```
 kubectl get nodes
-# Shows nodes in NotReady state
-Check node group IAM role has the required policies:
+```
 
+ Verify the node group IAM role has the appropriate permissions, including:
+
+```
 AmazonEKSWorkerNodePolicy
 AmazonEKS_CNI_Policy
 AmazonEC2ContainerRegistryReadOnly
-These are attached automatically by Terraform. If nodes are not joining, the apply may not have completed fully — check the apply logs.
+```
 
-Pipeline apply job is skipped
-The apply job only runs on:
+ Also check the Terraform/GitHub Actions apply logs for errors during node group creation.
 
-Push/merge to main when envs/dev/** or modules/** files changed
-Manual workflow_dispatch with action: apply
-If you only changed workflow files (.github/workflows/), the paths filter prevents the pipeline from triggering.
+---
 
-Cannot connect to EKS cluster locally
-# Re-fetch credentials
-aws eks update-kubeconfig --region us-east-1 --name pharma-dev-cluster
+ ## Cannot connect to EKS
 
-# Check your AWS identity
+ Refresh kubeconfig:
+
+```
+aws eks update-kubeconfig \
+  --region us-east-1 \
+  --name pharma-dev-cluster
+```
+
+ Verify your AWS identity:
+
+```
 aws sts get-caller-identity
+```
 
-# Verify cluster is active
-aws eks describe-cluster --name pharma-dev-cluster --query 'cluster.status'
-Only the IAM entity that created the cluster (the CI/CD role or your local user) has access by default. If using a different IAM user locally, you need to add it to the EKS aws-auth ConfigMap.
+ Check cluster status:
 
-Cost Estimate (Dev Environment)
-Resource	Approximate Cost
-EKS Cluster	$0.10/hour ($72/month)
-3x t3.small EC2 nodes	$0.06/hour ($43/month)
-RDS db.t3.micro	$0.02/hour ($14/month)
-NAT Gateway	$0.045/hour ($32/month) + data transfer
-ECR Storage	~$0.10/GB/month (minimal)
-Secrets Manager	~$0.40/secret/month (2 secrets = ~$0.80)
-Total estimate	~$160–180/month
-Tip for learners: Destroy the infrastructure when not in use. EKS and NAT Gateway are the largest costs. Use the destroy pipeline at the end of each day and re-provision when needed.
+```
+aws eks describe-cluster \
+  --name pharma-dev-cluster \
+  --query 'cluster.status'
+```
 
-This guide covers the dev environment. QA and prod environments follow the same setup process — create the GitHub environments with appropriate protection rules and add the corresponding secrets (QA_DB_PASSWORD, QA_JWT_SECRET, etc.).
+ Expected:
 
-16. Interview Preparation
-After completing this lab you have built and deployed real infrastructure — not watched a demo. Dedicated interview preparation documents are available in the docs/ folder:
+```
+"ACTIVE"
+```
 
-Terraform Interview Questions — 40 questions covering core concepts, state management, modules, CI/CD pipeline, and real-world scenarios with zen-infra references
-GitHub Actions Interview Questions — coming soon
-Built with Terraform 1.10+ · GitHub Actions · AWS EKS, RDS, ECR, VPC, IAM, Secrets Manager
+---
+
+ # 💰 Cost Estimate
+
+ Approximate dev environment costs:
+
+ | Resource | Approximate cost |
+| --- | --- |
+| EKS control plane | \~$0.10/hour |
+| 3 × `t3.small` | \~$43/month |
+| RDS `db.t3.micro` | \~$14/month |
+| NAT Gateway | \~$32/month + data transfer |
+| ECR | Minimal for small image storage |
+| Secrets Manager | \~$0.80/month for 2 secrets |
+| **Estimated total** | **\~$160–180/month** |
+
+AWS pricing varies by region, usage, data transfer, storage, and configuration. Treat these numbers as estimates rather than billing guarantees.
+
+ ### 💡 Tip for learners
+
+ If you're not actively using the environment:
+
+```
+terraform destroy
+```
+
+ EKS and NAT Gateway are among the larger ongoing costs in this architecture.
+
+---
+
+ # 🎯 Interview Preparation
+
+ This project is designed to demonstrate practical experience with:
+
+ - Terraform
+- Terraform modules
+- Terraform state
+- Remote S3 state
+- Infrastructure as Code
+- AWS VPC networking
+- Amazon EKS
+- Kubernetes
+- RDS PostgreSQL
+- Amazon ECR
+- IAM
+- IRSA
+- OIDC
+- AWS Secrets Manager
+- GitHub Actions
+- CI/CD
+- Infrastructure drift
+- Infrastructure lifecycle management
+
+ Recommended interview topics include:
+
+ ### Terraform
+
+ - State management
+- Remote backends
+- Modules
+- Variables and outputs
+- Resource dependencies
+- `terraform plan`
+- `terraform apply`
+- `terraform destroy`
+- Drift detection
+- State locking
+- Importing existing resources
+- Workspaces vs separate environments
+
+ ### AWS
+
+ - VPC design
+- Public vs private subnets
+- NAT Gateway
+- Internet Gateway
+- Route tables
+- Security groups
+- EKS networking
+- IAM
+- OIDC
+- IRSA
+- RDS networking
+
+ ### CI/CD
+
+ - GitHub Actions
+- Pull-request plans
+- Deployment approvals
+- Secrets management
+- OIDC authentication
+- Infrastructure deployment workflows
+
+---
+
+ # 🗺️ Environment Strategy
+
+ The repository supports three isolated environments:
+
+```
+envs/
+├── dev/
+├── qa/
+└── prod/
+```
+
+ Each environment:
+
+ - Has its own Terraform configuration
+- Has its own remote state key
+- Uses the same reusable modules
+- Can have different resource sizing
+- Can have different security and availability settings
+
+ Example:
+
+```
+                ┌───────────────┐
+                │ Shared Modules│
+                └───────┬───────┘
+                        │
+          ┌─────────────┼─────────────┐
+          │             │             │
+          ▼             ▼             ▼
+        DEV            QA           PROD
+          │             │             │
+       State          State         State
+       Object         Object        Object
+```
+
+---
+
+ # 📌 Design Principles
+
+ This project follows several core infrastructure principles:
+
+ 1. **Infrastructure as Code** — AWS infrastructure is defined in Terraform.
+2. **Reusable modules** — environments share common Terraform modules.
+3. **Remote state** — Terraform state is stored securely in S3.
+4. **Environment isolation** — dev, QA, and production use separate state.
+5. **Private workloads** — EKS nodes and RDS are deployed in private subnets.
+6. **Secrets outside Git** — sensitive values are stored in AWS Secrets Manager.
+7. **Least privilege** — IAM permissions should be scoped to required resources.
+8. **Automated validation** — Terraform plans run through GitHub Actions.
+9. **Human approval** — production infrastructure changes should require explicit approval.
+10. **Repeatability** — environments can be recreated from code.
+
+---
+
+ ## 📚 Project Documentation
+
+ Additional documentation can be found in the `docs/` directory:
+
+```
+docs/
+├── terraform-interview-questions.md
+└── github-actions-interview-questions.md
+```
+
+ The Terraform interview guide covers core Terraform concepts, state management, modules, CI/CD, and real-world scenarios based on this project.
+
+---
+
+ ## 🧰 Technology Stack
+
+ | Technology | Purpose |
+| --- | --- |
+| Terraform 1.10+ | Infrastructure as Code |
+| AWS | Cloud platform |
+| Amazon VPC | Networking |
+| Amazon EKS | Kubernetes |
+| Kubernetes | Container orchestration |
+| Amazon RDS | PostgreSQL database |
+| Amazon ECR | Container registry |
+| AWS IAM | Identity and access management |
+| AWS Secrets Manager | Secrets management |
+| Amazon S3 | Terraform state |
+| GitHub Actions | CI/CD |
+| NGINX Ingress | Kubernetes ingress |
+
+---
+
+ ## 👤 Project
+
+ **zen-pharma infrastructure**
+
+ Built with:
+
+ **Terraform · AWS · EKS · Kubernetes · RDS · ECR · IAM · Secrets Manager · GitHub Actions**
+
+ > Infrastructure should be reproducible, reviewable, and disposable.
