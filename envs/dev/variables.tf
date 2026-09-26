@@ -15,3 +15,11 @@ variable "github_org" {
   type        = string
   default     = "CloudTechs-ai"
 }
+
+variable "github_frontend_repo_id" {
+  type = string
+}
+
+variable "github_backend_repo_id" {
+  type = string
+}
